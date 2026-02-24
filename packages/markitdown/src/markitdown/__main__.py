@@ -110,6 +110,35 @@ def main():
         help="Keep data URIs (like base64-encoded images) in the output. By default, data URIs are truncated.",
     )
 
+    parser.add_argument(
+        "--extract-pdf-images",
+        action="store_true",
+        help="Extract embedded images from PDF files and append markdown image references to the output.",
+    )
+
+    parser.add_argument(
+        "--pdf-image-dir",
+        help="Directory where extracted PDF images are written when --extract-pdf-images is enabled.",
+    )
+
+    parser.add_argument(
+        "--extract-pdf-figures",
+        action="store_true",
+        help="Detect figure captions in PDFs, crop rendered figure regions, and append markdown references.",
+    )
+
+    parser.add_argument(
+        "--pdf-figure-dir",
+        help="Directory where extracted PDF figures are written when --extract-pdf-figures is enabled.",
+    )
+
+    parser.add_argument(
+        "--pdf-figure-dpi",
+        type=int,
+        default=300,
+        help="Render DPI used for extracted PDF figure crops (default: 300).",
+    )
+
     parser.add_argument("filename", nargs="?")
     args = parser.parse_args()
 
@@ -191,10 +220,22 @@ def main():
             sys.stdin.buffer,
             stream_info=stream_info,
             keep_data_uris=args.keep_data_uris,
+            extract_pdf_images=args.extract_pdf_images,
+            pdf_image_dir=args.pdf_image_dir,
+            extract_pdf_figures=args.extract_pdf_figures,
+            pdf_figure_dir=args.pdf_figure_dir,
+            pdf_figure_dpi=args.pdf_figure_dpi,
         )
     else:
         result = markitdown.convert(
-            args.filename, stream_info=stream_info, keep_data_uris=args.keep_data_uris
+            args.filename,
+            stream_info=stream_info,
+            keep_data_uris=args.keep_data_uris,
+            extract_pdf_images=args.extract_pdf_images,
+            pdf_image_dir=args.pdf_image_dir,
+            extract_pdf_figures=args.extract_pdf_figures,
+            pdf_figure_dir=args.pdf_figure_dir,
+            pdf_figure_dpi=args.pdf_figure_dpi,
         )
 
     _handle_output(args, result)

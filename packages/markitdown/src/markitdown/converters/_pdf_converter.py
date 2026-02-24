@@ -1,6 +1,9 @@
 import sys
 import io
 import re
+import shutil
+import tempfile
+from pathlib import Path
 from typing import BinaryIO, Any
 
 from .._base_converter import DocumentConverter, DocumentConverterResult
@@ -9,6 +12,7 @@ from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
 
 # Pattern for MasterFormat-style partial numbering (e.g., ".1", ".2", ".10")
 PARTIAL_NUMBERING_PATTERN = re.compile(r"^\.\d+$")
+FIGURE_CAPTION_PATTERN = re.compile(r"^\s*(fig(?:ure)?\.?)\s*(\d+[A-Za-z]?)\b", re.I)
 
 
 def _merge_partial_numbering_lines(text: str) -> str:
@@ -115,6 +119,442 @@ def _to_markdown_table(table: list[list[str]], include_separator: bool = True) -
         md = [fmt_row(row) for row in table]
 
     return "\n".join(md)
+
+
+def _sanitize_stem(name: str) -> str:
+    """Normalize names for filesystem-safe file/directory output."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return cleaned or "document"
+
+
+def _resolve_pdf_image_paths(
+    stream_info: StreamInfo, pdf_image_dir: str | None
+) -> tuple[Path, Path]:
+    """Return absolute output directory and markdown link directory."""
+    source_name = stream_info.filename or stream_info.local_path or "document.pdf"
+    source_stem = _sanitize_stem(Path(source_name).stem)
+
+    if pdf_image_dir is not None:
+        requested = Path(pdf_image_dir).expanduser()
+        if requested.is_absolute():
+            return requested, requested
+        return (Path.cwd() / requested).resolve(), requested
+
+    default_dir = Path(f"{source_stem}_images")
+    return (Path.cwd() / default_dir).resolve(), default_dir
+
+
+def _extract_pdf_images(
+    pdf_bytes: io.BytesIO,
+    *,
+    stream_info: StreamInfo,
+    pdf_image_dir: str | None,
+) -> list[str]:
+    """
+    Extract embedded image objects from a PDF and return markdown-safe link paths.
+    """
+    output_dir, link_dir = _resolve_pdf_image_paths(stream_info, pdf_image_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    source_name = stream_info.filename or stream_info.local_path or "document.pdf"
+    source_stem = _sanitize_stem(Path(source_name).stem)
+
+    with tempfile.TemporaryDirectory(prefix="markitdown_pdf_images_") as temp_dir:
+        pdf_bytes.seek(0)
+        pdfminer.high_level.extract_text_to_fp(
+            pdf_bytes,
+            io.StringIO(),
+            output_type="text",
+            codec="utf-8",
+            output_dir=temp_dir,
+        )
+
+        extracted = sorted(
+            path for path in Path(temp_dir).iterdir() if path.is_file()
+        )
+
+        image_links: list[str] = []
+        for idx, src in enumerate(extracted, start=1):
+            suffix = src.suffix.lower() or ".bin"
+            base_name = f"{source_stem}_image_{idx}{suffix}"
+            dst = output_dir / base_name
+
+            # Avoid overwriting existing files from prior runs.
+            if dst.exists():
+                collision = 1
+                while True:
+                    candidate = output_dir / f"{source_stem}_image_{idx}_{collision}{suffix}"
+                    if not candidate.exists():
+                        dst = candidate
+                        break
+                    collision += 1
+
+            shutil.copyfile(src, dst)
+
+            if link_dir.is_absolute():
+                image_links.append(dst.as_posix())
+            else:
+                image_links.append((link_dir / dst.name).as_posix())
+
+        return image_links
+
+
+def _resolve_pdf_figure_paths(
+    stream_info: StreamInfo, pdf_figure_dir: str | None
+) -> tuple[Path, Path]:
+    """Return absolute output directory and markdown link directory for figures."""
+    source_name = stream_info.filename or stream_info.local_path or "document.pdf"
+    source_stem = _sanitize_stem(Path(source_name).stem)
+
+    if pdf_figure_dir is not None:
+        requested = Path(pdf_figure_dir).expanduser()
+        if requested.is_absolute():
+            return requested, requested
+        return (Path.cwd() / requested).resolve(), requested
+
+    default_dir = Path(f"{source_stem}_figures")
+    return (Path.cwd() / default_dir).resolve(), default_dir
+
+
+def _to_bbox(obj: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """Normalize layout objects to an (x0, top, x1, bottom) tuple."""
+    try:
+        x0 = float(obj["x0"])
+        x1 = float(obj["x1"])
+        top = float(obj["top"])
+        bottom = float(obj["bottom"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if x1 <= x0 or bottom <= top:
+        return None
+
+    return (x0, top, x1, bottom)
+
+
+def _merge_bboxes(
+    bboxes: list[tuple[float, float, float, float]],
+    *,
+    gap: float = 10.0,
+) -> list[tuple[float, float, float, float]]:
+    """Merge overlapping/nearby boxes to build coherent graphic regions."""
+    current = sorted(bboxes, key=lambda b: (b[1], b[0]))
+    while True:
+        merged: list[tuple[float, float, float, float]] = []
+        for box in current:
+            x0, top, x1, bottom = box
+            did_merge = False
+            for i, (mx0, mtop, mx1, mbottom) in enumerate(merged):
+                intersects = not (
+                    x1 < mx0 - gap
+                    or x0 > mx1 + gap
+                    or bottom < mtop - gap
+                    or top > mbottom + gap
+                )
+                if intersects:
+                    merged[i] = (
+                        min(x0, mx0),
+                        min(top, mtop),
+                        max(x1, mx1),
+                        max(bottom, mbottom),
+                    )
+                    did_merge = True
+                    break
+
+            if not did_merge:
+                merged.append(box)
+
+        if merged == current:
+            return merged
+        current = sorted(merged, key=lambda b: (b[1], b[0]))
+
+
+def _extract_caption_lines(page: Any) -> list[dict[str, Any]]:
+    """Extract figure captions (e.g., Fig. 1 / Figure 2) as line-level records."""
+    words = page.extract_words(keep_blank_chars=True, x_tolerance=2, y_tolerance=2)
+    if not words:
+        return []
+
+    y_tolerance = 3
+    lines_by_y: dict[float, list[dict[str, Any]]] = {}
+    for word in words:
+        y_key = round(float(word["top"]) / y_tolerance) * y_tolerance
+        lines_by_y.setdefault(y_key, []).append(word)
+
+    captions: list[dict[str, Any]] = []
+    for y_key in sorted(lines_by_y.keys()):
+        row_words = sorted(lines_by_y[y_key], key=lambda w: float(w["x0"]))
+        text = " ".join(str(w["text"]).strip() for w in row_words).strip()
+        if not text:
+            continue
+
+        match = FIGURE_CAPTION_PATTERN.match(text)
+        if match is None:
+            continue
+
+        captions.append(
+            {
+                "text": text,
+                "figure_id": match.group(2),
+                "x0": min(float(w["x0"]) for w in row_words),
+                "x1": max(float(w["x1"]) for w in row_words),
+                "top": min(float(w["top"]) for w in row_words),
+                "bottom": max(float(w["bottom"]) for w in row_words),
+            }
+        )
+
+    return captions
+
+
+def _collect_graphic_regions(page: Any) -> list[tuple[float, float, float, float]]:
+    """Collect non-text layout element regions likely belonging to figures."""
+    raw_boxes: list[tuple[float, float, float, float]] = []
+
+    for element in getattr(page, "images", []):
+        bbox = _to_bbox(element)
+        if bbox is not None:
+            raw_boxes.append(bbox)
+
+    for element in getattr(page, "rects", []):
+        bbox = _to_bbox(element)
+        if bbox is not None:
+            raw_boxes.append(bbox)
+
+    for element in getattr(page, "curves", []):
+        bbox = _to_bbox(element)
+        if bbox is not None:
+            raw_boxes.append(bbox)
+
+    for element in getattr(page, "lines", []):
+        bbox = _to_bbox(element)
+        if bbox is not None:
+            raw_boxes.append(bbox)
+
+    # Ignore tiny decorative artifacts.
+    filtered = []
+    for x0, top, x1, bottom in raw_boxes:
+        width = x1 - x0
+        height = bottom - top
+        if width >= 6 and height >= 6:
+            filtered.append((x0, top, x1, bottom))
+
+    return _merge_bboxes(filtered, gap=12.0)
+
+
+def _horizontal_overlap_ratio(
+    a: tuple[float, float], b: tuple[float, float]
+) -> float:
+    overlap = max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+    denom = max(1.0, min(a[1] - a[0], b[1] - b[0]))
+    return overlap / denom
+
+
+def _expand_region_with_nearby_words(
+    region: tuple[float, float, float, float],
+    words: list[dict[str, Any]],
+    *,
+    caption_top: float,
+    page_width: float,
+    margin: float = 18.0,
+) -> tuple[float, float, float, float]:
+    """Expand a graphic region to include nearby labels (axes/ticks/legends)."""
+    x0, top, x1, bottom = region
+    expanded = (x0, top, x1, bottom)
+
+    for word in words:
+        wbox = _to_bbox(word)
+        if wbox is None:
+            continue
+        wx0, wtop, wx1, wbottom = wbox
+
+        # Keep labels that are spatially near the graphic and above the caption.
+        if wbottom > caption_top + 2:
+            continue
+        if wx1 < expanded[0] - margin or wx0 > expanded[2] + margin:
+            continue
+        if wbottom < expanded[1] - margin or wtop > expanded[3] + margin:
+            continue
+
+        expanded = (
+            min(expanded[0], wx0),
+            min(expanded[1], wtop),
+            max(expanded[2], wx1),
+            max(expanded[3], wbottom),
+        )
+
+    return (
+        max(0.0, expanded[0] - margin),
+        max(0.0, expanded[1] - margin),
+        min(page_width, expanded[2] + margin),
+        expanded[3] + margin,
+    )
+
+
+def _select_region_for_caption(
+    caption: dict[str, Any],
+    regions: list[tuple[float, float, float, float]],
+    *,
+    page_width: float,
+    used_indices: set[int],
+) -> tuple[int, tuple[float, float, float, float]] | None:
+    """Choose the most plausible region above a figure caption."""
+    caption_top = float(caption["top"])
+    caption_x0 = float(caption["x0"])
+    caption_x1 = float(caption["x1"])
+
+    best_idx = -1
+    best_score = float("inf")
+    best_region: tuple[float, float, float, float] | None = None
+
+    caption_band = (
+        max(0.0, caption_x0 - page_width * 0.12),
+        min(page_width, caption_x1 + page_width * 0.12),
+    )
+
+    def choose(min_overlap: float) -> tuple[int, float, tuple[float, float, float, float]] | None:
+        local_best_idx = -1
+        local_best_score = float("inf")
+        local_best_region: tuple[float, float, float, float] | None = None
+
+        for idx, region in enumerate(regions):
+            if idx in used_indices:
+                continue
+
+            rx0, rtop, rx1, rbottom = region
+            width = rx1 - rx0
+            height = rbottom - rtop
+            if width < page_width * 0.12 or height < 24:
+                continue
+
+            if rbottom > caption_top - 2:
+                continue
+
+            vertical_gap = caption_top - rbottom
+            if vertical_gap > 520:
+                continue
+
+            overlap = _horizontal_overlap_ratio((rx0, rx1), caption_band)
+            if overlap < min_overlap:
+                continue
+
+            area_penalty = 4000.0 / max(1.0, width * height)
+            score = vertical_gap + (1.0 - overlap) * 120 + area_penalty
+            if score < local_best_score:
+                local_best_idx = idx
+                local_best_score = score
+                local_best_region = region
+
+        if local_best_region is None:
+            return None
+        return local_best_idx, local_best_score, local_best_region
+
+    strict = choose(0.18)
+    relaxed = choose(0.08) if strict is None else strict
+    if relaxed is not None:
+        best_idx, best_score, best_region = relaxed
+
+    if best_region is None:
+        return None
+    return best_idx, best_region
+
+
+def _extract_pdf_figures(
+    pdf_bytes: io.BytesIO,
+    *,
+    stream_info: StreamInfo,
+    pdf_figure_dir: str | None,
+    pdf_figure_dpi: int = 300,
+) -> list[tuple[str, str]]:
+    """
+    Extract rendered figure crops by aligning caption lines with nearby graphic regions.
+    """
+    output_dir, link_dir = _resolve_pdf_figure_paths(stream_info, pdf_figure_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    source_name = stream_info.filename or stream_info.local_path or "document.pdf"
+    source_stem = _sanitize_stem(Path(source_name).stem)
+    figure_dpi = max(96, int(pdf_figure_dpi))
+
+    results: list[tuple[str, str]] = []
+    figure_counter = 0
+
+    pdf_bytes.seek(0)
+    with pdfplumber.open(pdf_bytes) as pdf:
+        for page_index, page in enumerate(pdf.pages, start=1):
+            captions = _extract_caption_lines(page)
+            if not captions:
+                continue
+
+            regions = _collect_graphic_regions(page)
+            if not regions:
+                continue
+
+            words = page.extract_words(keep_blank_chars=True, x_tolerance=2, y_tolerance=2)
+            used_indices: set[int] = set()
+            page_image = None
+
+            for caption in captions:
+                selected = _select_region_for_caption(
+                    caption,
+                    regions,
+                    page_width=float(page.width),
+                    used_indices=used_indices,
+                )
+                if selected is None:
+                    continue
+
+                region_idx, base_region = selected
+                used_indices.add(region_idx)
+                figure_region = _expand_region_with_nearby_words(
+                    base_region,
+                    words,
+                    caption_top=float(caption["top"]),
+                    page_width=float(page.width),
+                )
+
+                if page_image is None:
+                    page_image = page.to_image(resolution=figure_dpi).original
+
+                scale = figure_dpi / 72.0
+                left = int(max(0.0, figure_region[0] * scale))
+                top = int(max(0.0, figure_region[1] * scale))
+                right = int(min(page_image.width, figure_region[2] * scale))
+                bottom = int(min(page_image.height, figure_region[3] * scale))
+
+                if right - left < 30 or bottom - top < 30:
+                    continue
+
+                crop = page_image.crop((left, top, right, bottom))
+                figure_counter += 1
+                figure_id = str(caption["figure_id"]).replace(" ", "")
+                filename = (
+                    f"{source_stem}_figure_{figure_id}.png"
+                    if figure_id
+                    else f"{source_stem}_figure_{figure_counter}.png"
+                )
+                destination = output_dir / filename
+
+                if destination.exists():
+                    suffix = 1
+                    while True:
+                        candidate = output_dir / (
+                            f"{Path(filename).stem}_{suffix}{Path(filename).suffix}"
+                        )
+                        if not candidate.exists():
+                            destination = candidate
+                            break
+                        suffix += 1
+
+                crop.save(destination, format="PNG")
+
+                if link_dir.is_absolute():
+                    markdown_path = destination.as_posix()
+                else:
+                    markdown_path = (link_dir / destination.name).as_posix()
+
+                results.append((str(caption["text"]), markdown_path))
+
+    return results
 
 
 def _extract_form_content_from_words(page: Any) -> str | None:
@@ -583,5 +1023,41 @@ class PdfConverter(DocumentConverter):
 
         # Post-process to merge MasterFormat-style partial numbering with following text
         markdown = _merge_partial_numbering_lines(markdown)
+
+        if kwargs.get("extract_pdf_images", False):
+            image_links = _extract_pdf_images(
+                pdf_bytes,
+                stream_info=stream_info,
+                pdf_image_dir=kwargs.get("pdf_image_dir"),
+            )
+            if image_links:
+                images_section = ["## Extracted Images"]
+                images_section.extend(
+                    f"![PDF image {idx}]({path})"
+                    for idx, path in enumerate(image_links, start=1)
+                )
+                markdown = (
+                    markdown.rstrip() + "\n\n" + "\n".join(images_section)
+                    if markdown
+                    else "\n".join(images_section)
+                )
+
+        if kwargs.get("extract_pdf_figures", False):
+            figure_links = _extract_pdf_figures(
+                pdf_bytes,
+                stream_info=stream_info,
+                pdf_figure_dir=kwargs.get("pdf_figure_dir"),
+                pdf_figure_dpi=kwargs.get("pdf_figure_dpi", 300),
+            )
+            if figure_links:
+                figures_section = ["## Extracted Figures"]
+                figures_section.extend(
+                    f"![{caption}]({path})" for caption, path in figure_links
+                )
+                markdown = (
+                    markdown.rstrip() + "\n\n" + "\n".join(figures_section)
+                    if markdown
+                    else "\n".join(figures_section)
+                )
 
         return DocumentConverterResult(markdown=markdown)

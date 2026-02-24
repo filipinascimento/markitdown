@@ -88,6 +88,18 @@ Or use `-o` to specify the output file:
 markitdown path-to-file.pdf -o document.md
 ```
 
+To also extract embedded PDF images and append markdown image references:
+
+```bash
+markitdown path-to-file.pdf -o document.md --extract-pdf-images --pdf-image-dir pdf_images
+```
+
+To extract rendered figure crops (caption-aligned, e.g., "Fig. 1") from PDFs:
+
+```bash
+markitdown path-to-file.pdf -o document.md --extract-pdf-figures --pdf-figure-dir pdf_figures --pdf-figure-dpi 300
+```
+
 You can also pipe content:
 
 ```bash
@@ -161,6 +173,35 @@ from markitdown import MarkItDown
 
 md = MarkItDown(docintel_endpoint="<document_intelligence_endpoint>")
 result = md.convert("test.pdf")
+print(result.text_content)
+```
+
+PDF conversion with optional image extraction in Python:
+
+```python
+from markitdown import MarkItDown
+
+md = MarkItDown()
+result = md.convert(
+    "test.pdf",
+    extract_pdf_images=True,
+    pdf_image_dir="pdf_images",  # Optional. Defaults to ./<pdf-stem>_images
+)
+print(result.text_content)
+```
+
+PDF conversion with optional figure extraction in Python:
+
+```python
+from markitdown import MarkItDown
+
+md = MarkItDown()
+result = md.convert(
+    "test.pdf",
+    extract_pdf_figures=True,
+    pdf_figure_dir="pdf_figures",  # Optional. Defaults to ./<pdf-stem>_figures
+    pdf_figure_dpi=300,
+)
 print(result.text_content)
 ```
 

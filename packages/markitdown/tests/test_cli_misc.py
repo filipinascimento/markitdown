@@ -27,8 +27,22 @@ def test_invalid_flag() -> None:
     assert "SYNTAX" in result.stderr, "Expected 'SYNTAX' to appear in STDERR"
 
 
+def test_help_includes_pdf_image_flags() -> None:
+    result = subprocess.run(
+        ["python", "-m", "markitdown", "--help"], capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, f"CLI exited with error: {result.stderr}"
+    assert "--extract-pdf-images" in result.stdout
+    assert "--pdf-image-dir" in result.stdout
+    assert "--extract-pdf-figures" in result.stdout
+    assert "--pdf-figure-dir" in result.stdout
+    assert "--pdf-figure-dpi" in result.stdout
+
+
 if __name__ == "__main__":
     """Runs this file's tests from the command line."""
     test_version()
     test_invalid_flag()
+    test_help_includes_pdf_image_flags()
     print("All tests passed!")
